@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+exec python3 -u - "$@" <<'PY'
+import sys
+import argparse
+from lifxlan.device import Device
+from lifxlan.light import Light
+from lifxlan.multizonelight import MultiZoneLight
+
+DEFAULT_IP = os.environ.get("LIFX_BEAM_IP", "192.168.1.100")
+DEFAULT_MAC = os.environ.get("LIFX_BEAM_MAC", "d0:73:d5:00:00:00")
+DEFAULT_PORT = 56700
+SERVICE = 1
+SOURCE_ID = 12345
+
+PRESETS = {
+    # Hue [0-65535], Saturation [0-65535], Brightness [0-65535], Kelvin [2500-9000]
+    "amber-glow": {
+        "start": (2000, 65535, 50000, 3000),  # red-orange
+        "end": (8000, 65535, 50000, 3000)     # warm amber
+    },
+    "sunset": {
+        "start": (0, 65535, 50000, 3000),     # deep red
+        "end": (10000, 65535, 50000, 3500)    # gold / amber
+    },
+    "cyberpunk": {
+        "start": (54000, 65535, 50000, 3500), # magenta/pink
+        "end": (35000, 65535, 50000, 3500)    # cyan
+    },
+    "ocean": {
+        "start": (35000, 65535, 45000, 4000), # cyan
+        "end": (43690, 65535, 50000, 4000)    # blue
+    },
+    "forest": {
+        "start": (15000, 65535, 45000, 3500), # lime / yellow-green
+        "end": (25000, 65535, 50000, 3500)    # deep emerald green
+    }
+}
+
+def get_beam(ip=DEFAULT_IP, mac=DEFAULT_MAC):
+    return MultiZoneLight(mac, ip, SERVICE, DEFAULT_PORT, SOURCE_ID)
+
+def apply_gradient(beam, start_hsbk, end_hsbk, duration_ms=2500, num_zones=40):
+    """Cubic-ease transition default 2.5–3.0s for daytime-to-reading/ambient
+    glides; --fast / --duration-ms let callers override. Smooth, not abrupt."""
+    colors = []
+    for i in range(num_zones):
+        frac = i / float(num_zones - 1) if num_zones > 1 else 0
+        # Cubic ease curve: slow start, smooth middle, gentle settle at end.
+        eased = frac ** 1.8 if frac < 0.5 else 1.0 - (1.0 - frac) ** 1.8
+        h = int(start_hsbk[0] + eased * (end_hsbk[0] - start_hsbk[0]))
+        s = int(start_hsbk[1] + eased * (end_hsbk[1] - start_hsbk[1]))
+        b = int(start_hsbk[2] + eased * (end_hsbk[2] - start_hsbk[2]))
+        k = int(start_hsbk[3] + eased * (end_hsbk[3] - start_hsbk[3]))
+        colors.append((h, s, b, k))
+    if hasattr(beam, "extended_set_zone_color"):
+        beam.extended_set_zone_color(colors, duration=duration_ms)
+    else:
+        beam.set_zone_colors(colors, duration=duration_ms)
+
+def main():
+    parser = argparse.ArgumentParser(description="Control LIFX Beam multi-zone light")
+    parser.add_argument("--ip", default=DEFAULT_IP, help=f"IP address (default: {DEFAULT_IP})")
+    parser.add_argument("--mac", default=DEFAULT_MAC, help=f"MAC address (default: {DEFAULT_MAC})")
+    
+    subparsers = parser.add_subparsers(dest="command")
+    
+    # status
+    subparsers.add_parser("status", help="Get light power and zone status")
+    
+    # on / off
+    subparsers.add_parser("on", help="Turn power on")
+    subparsers.add_parser("off", help="Turn power off")
+    
+    # preset
+    preset_parser = subparsers.add_parser("preset", help="Apply a pre-configured gradient")
+    preset_parser.add_argument("name", choices=list(PRESETS.keys()), help="Preset name")
+    preset_parser.add_argument("--duration", type=int, default=2500, help="Transition time in ms (cubic ease default 2.5s)")
+    preset_parser.add_argument("--fast", type=bool, default=False, help="Skip cubic ease, 1000ms fast transition")
+    
+    # gradient
+    grad_parser = subparsers.add_parser("gradient", help="Apply a custom 2-color gradient across all zones")
+    grad_parser.add_argument("--start-hue", type=int, required=True, help="Start hue (0-65535)")
+    grad_parser.add_argument("--end-hue", type=int, required=True, help="End hue (0-65535)")
+    grad_parser.add_argument("--sat", type=int, default=65535, help="Saturation (0-65535)")
+    grad_parser.add_argument("--bright", type=int, default=50000, help="Brightness (0-65535)")
+    grad_parser.add_argument("--kelvin", type=int, default=3000, help="Kelvin (2500-9000)")
+    grad_parser.add_argument("--duration", type=int, default=2500, help="Transition time in ms (cubic ease default 2.5s)")
+    grad_parser.add_argument("--fast", type=bool, default=False, help="Skip cubic ease, 1000ms fast transition")
+
+    # solid
+    solid_parser = subparsers.add_parser("solid", help="Set entire beam to a single color")
+    solid_parser.add_argument("--hue", type=int, required=True, help="Hue (0-65535)")
+    solid_parser.add_argument("--sat", type=int, default=65535, help="Saturation (0-65535)")
+    solid_parser.add_argument("--bright", type=int, default=50000, help="Brightness (0-65535)")
+    solid_parser.add_argument("--kelvin", type=int, default=3000, help="Kelvin (2500-9000)")
+    solid_parser.add_argument("--duration", type=int, default=2500, help="Transition time in ms (cubic ease default 2.5s)")
+    solid_parser.add_argument("--fast", type=bool, default=False, help="Skip cubic ease, 1000ms fast transition")
+
+    # exemption
+    ex_parser = subparsers.add_parser("exemption", help="Manage temporary daily exemptions (auto-resets at morning)")
+    ex_parser.add_argument("action", choices=["set-weekday", "set-weekend", "set-reading", "set-nightlight", "set-amber-glow", "clear", "status"], help="Exemption action")
+    ex_parser.add_argument("--hours", type=float, default=None, help="Hold duration in hours")
+
+    # extend
+    ext_parser = subparsers.add_parser("extend", help="Rewind circadian schedule back by N hours and let it progress from there")
+    ext_parser.add_argument("--hours", type=float, default=1.0, help="Hours to shift back and hold (default: 1.0)")
+
+    # reading
+    rd_parser = subparsers.add_parser("reading", help="Trigger reading light preset (default hold 30 min, use --hours 0 for all day)")
+    rd_parser.add_argument("--hours", type=float, default=0.5, help="Hold duration in hours (default: 0.5, 0 = indefinite/until morning)")
+
+    # nightlight
+    nl_parser = subparsers.add_parser("nightlight", help="Trigger nightlight preset and hold (default 1h, use --hours 0 for all night)")
+    nl_parser.add_argument("--hours", type=float, default=1.0, help="Hold duration in hours (default: 1.0, 0 = indefinite/until morning)")
+
+    # amber-glow
+    ag_parser = subparsers.add_parser("amber-glow", help="Trigger amber-glow preset and hold for specified hours (default 1h)")
+    ag_parser.add_argument("--hours", type=float, default=1.0, help="Hold duration in hours (default: 1.0)")
+
+    # freeze / unfreeze
+    frz_parser = subparsers.add_parser("freeze", help="FREEZE the beam's current lighting and hold it across days (default: until unfreeze; use --hours to auto-expire and return to the normal schedule)")
+    frz_parser.add_argument("--hours", type=float, default=None, help="Optional: auto-release after N hours, resuming the normal schedule")
+
+    subparsers.add_parser("unfreeze", help="RELEASE a frozen lighting hold; the normal circadian schedule resumes on the next tick")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    beam = get_beam(args.ip, args.mac)
+
+    if args.command == "status":
+        power = beam.get_power()
+        print(f"Device: {beam.get_product_name()} ({beam.get_label()})")
+        print(f"Power: {'ON' if power > 0 else 'OFF'} ({power})")
+        zones = beam.get_color_zones()
+        print(f"Zones: {len(zones)}")
+        print(f"Zone 0 (start): HSBK={zones[0]}")
+        print(f"Zone {len(zones)-1} (end): HSBK={zones[-1]}")
+    elif args.command == "on":
+        # Return to the normal schedule in one call: clear any hold and apply
+        # the schedule right now. If the schedule is currently dark, hold a
+        # nightlight until the next scheduled lit moment so the beam stays
+        # lit while still resuming the schedule automatically.
+        try:
+            import os, sys
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            circadian_engine.clear_exemption()
+            lb_now = circadian_engine.get_long_beach_now()
+            cur_min = lb_now.hour * 60 + lb_now.minute
+            is_weekend = lb_now.weekday() >= 5
+            cond = circadian_engine.get_weather_condition()
+            sunset_m = circadian_engine.calculate_sunset_minute(lb_now)
+            zones = circadian_engine.calculate_beam_zones(
+                cur_min, is_weekend=is_weekend,
+                weather_state=circadian_engine.parse_weather_state(cond),
+                sunset_min=sunset_m,
+            )
+            if sum(z[2] for z in zones) > 0:
+                circadian_engine.apply_to_beam(zones, ip=args.ip, mac=args.mac, duration_ms=2500)
+                print("LIFX Beam ON — back on the normal circadian schedule.")
+            else:
+                _, expiry = circadian_engine.hold_until_next_schedule(preset="nightlight")
+                circadian_engine.apply_to_beam(
+                    circadian_engine.get_nightlight_zones(),
+                    ip=args.ip, mac=args.mac, duration_ms=2500,
+                )
+                print(f"LIFX Beam ON — nightlight until {expiry.strftime('%H:%M %Z')}, then the normal schedule resumes.")
+        except Exception as e:
+            beam.set_power(65535)
+            print(f"LIFX Beam turned ON (fallback — schedule path unavailable: {e})")
+    elif args.command == "off":
+        # Atomic in one call: schedule-aware off-hold FIRST (closes the race
+        # with the daemon's 30s tick — no mid-wipe relight), then the smooth
+        # red wipe if the beam is actually lit. The hold expires at the next
+        # scheduled lit/dark transition, so the normal schedule ALWAYS
+        # resumes — even when the command comes past midnight.
+        try:
+            import os, sys
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            _, expiry = circadian_engine.hold_until_next_schedule(power="off")
+            lit = beam.get_power() > 0
+            if lit:
+                circadian_engine.fade_to_black_wipe(ip=args.ip, mac=args.mac, duration_sec=2.0)
+            state = "OFF (smooth 2s red top-to-bottom wipe)" if lit else "OFF (already dark)"
+            print(f"LIFX Beam {state} — held until {expiry.strftime('%H:%M %Z')}, then the normal schedule resumes.")
+        except Exception:
+            beam.set_power(0)
+            print("LIFX Beam turned OFF (fallback instant off — no hold set, schedule unchanged)")
+    elif args.command == "preset":
+        p = PRESETS[args.name]
+        apply_gradient(beam, p["start"], p["end"], duration_ms=args.duration)
+        print(f"Applied preset '{args.name}'")
+    elif args.command == "gradient":
+        start_hsbk = (args.start_hue, args.sat, args.bright, args.kelvin)
+        end_hsbk = (args.end_hue, args.sat, args.bright, args.kelvin)
+        apply_gradient(beam, start_hsbk, end_hsbk, duration_ms=args.duration)
+        print(f"Applied gradient ({args.start_hue} -> {args.end_hue})")
+    elif args.command == "solid":
+        color = (args.hue, args.sat, args.bright, args.kelvin)
+        beam.set_color(color, duration=args.duration)
+        print(f"Set solid color HSBK={color}")
+    elif args.command == "extend":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            from zoneinfo import ZoneInfo
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            hours = args.hours if args.hours is not None else 1.0
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=hours) if hours > 0 else None
+            shift_min = int(-hours * 60)
+            circadian_engine.set_exemption(time_shift_minutes=shift_min, expires_at=expires_at)
+            lb_now = circadian_engine.get_long_beach_now()
+            cur_min = lb_now.hour * 60 + lb_now.minute
+            is_weekend = lb_now.weekday() >= 5
+            cond = circadian_engine.get_weather_condition()
+            sunset_m = circadian_engine.calculate_sunset_minute(lb_now)
+            zones = circadian_engine.calculate_beam_zones(cur_min, is_weekend=is_weekend, weather_state=circadian_engine.parse_weather_state(cond), sunset_min=sunset_m)
+            circadian_engine.apply_to_beam(zones, ip=args.ip, mac=args.mac, duration_ms=2500)
+            exp_str = f" until {expires_at.astimezone(ZoneInfo('America/Los_Angeles')).strftime('%H:%M %Z')}" if expires_at else ""
+            print(f"Extended lighting by rewinding schedule 1h ({shift_min} min){exp_str}. Normal progression continues from there.")
+        except Exception as e:
+            print(f"Error extending schedule: {e}")
+    elif args.command == "reading":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            from zoneinfo import ZoneInfo
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            expires_at = None
+            if args.hours and args.hours > 0:
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=args.hours)
+            circadian_engine.set_exemption(preset="reading", expires_at=expires_at)
+            zones = circadian_engine.get_reading_light_zones()
+            circadian_engine.apply_to_beam(zones, ip=args.ip, mac=args.mac, duration_ms=2500)
+            if expires_at:
+                lb_tz = ZoneInfo("America/Los_Angeles")
+                print(f"Activated Reading Light preset, holding for {args.hours} hour(s) (until {expires_at.astimezone(lb_tz).strftime('%H:%M %Z')}).")
+            else:
+                print("Activated Reading Light preset (holding until morning schedule reset).")
+        except Exception as e:
+            print(f"Error activating reading light: {e}")
+    elif args.command == "nightlight":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            expires_at = None
+            if args.hours and args.hours > 0:
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=args.hours)
+            circadian_engine.set_exemption(preset="nightlight", expires_at=expires_at)
+            zones = circadian_engine.get_nightlight_zones()
+            circadian_engine.apply_to_beam(zones, ip=args.ip, mac=args.mac, duration_ms=2500)
+            if expires_at:
+                print(f"Activated Nightlight preset and holding for {args.hours} hour(s) (until {expires_at.strftime('%H:%M:%S UTC')}).")
+            else:
+                print("Activated Nightlight preset (holding for the night until morning schedule reset).")
+        except Exception as e:
+            print(f"Error activating nightlight: {e}")
+    elif args.command == "amber-glow":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=args.hours)
+            circadian_engine.set_exemption(preset="amber-glow", expires_at=expires_at)
+            zones = circadian_engine.get_amber_glow_zones()
+            circadian_engine.apply_to_beam(zones, ip=args.ip, mac=args.mac, duration_ms=2500)
+            print(f"Activated Amber-Glow preset and holding for {args.hours} hour(s) (until {expires_at.strftime('%H:%M:%S UTC')}).")
+        except Exception as e:
+            print(f"Error activating amber-glow: {e}")
+    elif args.command == "exemption":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            expires_at = None
+            if args.hours:
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=args.hours)
+            if args.action == "set-weekday":
+                circadian_engine.set_exemption(schedule="weekday", expires_at=expires_at)
+                print("Exemption set: weekday schedule for today.")
+            elif args.action == "set-weekend":
+                circadian_engine.set_exemption(schedule="weekend", expires_at=expires_at)
+                print("Exemption set: weekend schedule for today.")
+            elif args.action == "set-reading":
+                circadian_engine.set_exemption(preset="reading", expires_at=expires_at)
+                print("Exemption set: reading light preset for today.")
+            elif args.action == "set-nightlight":
+                circadian_engine.set_exemption(preset="nightlight", expires_at=expires_at)
+                print(f"Exemption set: nightlight preset for today (expires: {expires_at}).")
+            elif args.action == "set-amber-glow":
+                circadian_engine.set_exemption(preset="amber-glow", expires_at=expires_at)
+                print(f"Exemption set: amber-glow preset for today (expires: {expires_at}).")
+            elif args.action == "clear":
+                circadian_engine.clear_exemption()
+                print("Exemption cleared.")
+            elif args.action == "status":
+                ex = circadian_engine.get_exemption()
+                print(f"Active exemption: {ex}")
+        except Exception as e:
+            print(f"Error handling exemption: {e}")
+    elif args.command == "freeze":
+        try:
+            import os, sys
+            from datetime import timedelta, timezone, datetime
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            expires_at = None
+            if args.hours and args.hours > 0:
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=args.hours)
+            data = circadian_engine.freeze_current_lighting(expires_at=expires_at)
+            lit = sum(1 for z in data["zones"] if z[2] > 0)
+            if expires_at:
+                print(f"FROZEN current lighting ({lit} zones) — auto-releases after {args.hours}h, normal schedule resumes.")
+            else:
+                print(f"FROZEN current lighting ({lit} zones) — held across days until 'lifx-beam unfreeze'.")
+        except Exception as e:
+            print(f"Error freezing lighting: {e}")
+    elif args.command == "unfreeze":
+        try:
+            import os, sys
+            sys.path.insert(0, os.path.expanduser("~/projects/infra/skills/lifx"))
+            import circadian_engine
+            circadian_engine.unfreeze()
+            print("UNFROZEN — normal circadian schedule resumes on the next tick.")
+        except Exception as e:
+            print(f"Error unfreezing lighting: {e}")
+
+if __name__ == "__main__":
+    main()
+PY
