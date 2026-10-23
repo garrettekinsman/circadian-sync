@@ -24,17 +24,12 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import circadian_engine
 
-# Attempt lifxlan import via lifx venv if available, or fallback gracefully
+# lifxlan is optional — everything runs in simulation mode without hardware
 beam_device = None
 DEFAULT_IP = os.environ.get("LIFX_BEAM_IP", "192.168.1.100")
 DEFAULT_MAC = os.environ.get("LIFX_BEAM_MAC", "d0:73:d5:00:00:00")
 
 try:
-    import glob
-    site_dirs = glob.glob(os.path.expanduser("~/.venvs/lifx/lib/python*/site-packages"))
-    for s_dir in site_dirs:
-        if s_dir not in sys.path:
-            sys.path.insert(0, s_dir)
     from lifxlan.multizonelight import MultiZoneLight  # type: ignore
     beam_device = MultiZoneLight(DEFAULT_MAC, DEFAULT_IP, 1, 56700, 12345)
 except Exception as e:
